@@ -137,46 +137,30 @@ namespace RabbitMQ.Stream.Client
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ParseChunk(Chunk chunk)
+        private List<Task> ParseChunk(Chunk chunk)
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            void DispatchMessage(ref SequenceReader<byte> sequenceReader, ulong i)
+            Task DispatchMessage(ref SequenceReader<byte> sequenceReader, ulong i)
             {
                 WireFormatting.ReadUInt32(ref sequenceReader, out var len);
-                try
+
+                var message = Message.From(ref sequenceReader, len);
+                message.MessageOffset = chunk.ChunkId + i;
+                if (MaybeDispatch(message.MessageOffset))
                 {
-                    var message = Message.From(ref sequenceReader, len);
-                    message.MessageOffset = chunk.ChunkId + i;
-                    if (MaybeDispatch(message.MessageOffset))
+                    if (Token.IsCancellationRequested)
                     {
-                        if (Token.IsCancellationRequested)
-                        {
-                            return;
-                        }
-
-                        _config.MessageHandler(this,
-                            new MessageContext(message.MessageOffset, TimeSpan.FromMilliseconds(chunk.Timestamp)),
-                            message).Wait(Token);
+                        return Task.CompletedTask;
                     }
-                }
-                catch (ArgumentOutOfRangeException e)
-                {
-                    _logger.LogError(e, "Unexpected error while parsing message. Message will be skipped. " +
-                                        "Please report this issue to the RabbitMQ team on GitHub {Repo}",
-                        Consts.RabbitMQClientRepo);
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogWarning(
-                        "OperationCanceledException. The consumer id: {SubscriberId} reference: {Reference} has been closed while consuming messages",
-                        _subscriberId, _config.Reference);
-                }
-                catch (Exception e)
-                {
-                    _logger.LogError(e, "Error while processing chunk: {ChunkId}", chunk.ChunkId);
-                }
-            }
 
+                    return _config.MessageHandler(this,
+                        new MessageContext(message.MessageOffset, TimeSpan.FromMilliseconds(chunk.Timestamp)),
+                        message);
+                }
+
+                return Task.CompletedTask;
+            }
+            var result = new List<Task>();
             var reader = new SequenceReader<byte>(chunk.Data);
 
             var numRecords = chunk.NumRecords;
@@ -203,7 +187,7 @@ namespace RabbitMQ.Stream.Client
 
                     for (ulong z = 0; z < subEntryChunk.NumRecordsInBatch; z++)
                     {
-                        DispatchMessage(ref readerUnCompressed, messageOffset++);
+                        result.Add(DispatchMessage(ref reader, messageOffset++));
                     }
 
                     numRecords -= subEntryChunk.NumRecordsInBatch;
@@ -213,10 +197,11 @@ namespace RabbitMQ.Stream.Client
                     // Ok the entry is a standard entry
                     // we need to rewind the stream to one byte to decode the messages
                     reader.Rewind(1);
-                    DispatchMessage(ref reader, messageOffset++);
+                    result.Add(DispatchMessage(ref reader, messageOffset++));
                     numRecords--;
                 }
             }
+            return result;
         }
 
         private async Task Init()
@@ -268,7 +253,28 @@ namespace RabbitMQ.Stream.Client
                     await _client.Credit(deliver.SubscriptionId, 1).ConfigureAwait(false);
                     // parse the chunk, we have another function because the sequence reader
                     // can't be used in async context
-                    ParseChunk(deliver.Chunk);
+                    var tasks = ParseChunk(deliver.Chunk);
+
+                    try
+                    {
+                        await Task.WhenAll(tasks).WaitAsync(Token).ConfigureAwait(false);
+                    }
+                    catch (ArgumentOutOfRangeException e)
+                    {
+                        _logger.LogError(e, "Unexpected error while parsing message. Message will be skipped. " +
+                                            "Please report this issue to the RabbitMQ team on GitHub {Repo}",
+                            Consts.RabbitMQClientRepo);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        _logger.LogWarning(
+                            "OperationCanceledException. The consumer id: {SubscriberId} reference: {Reference} has been closed while consuming messages",
+                            _subscriberId, _config.Reference);
+                    }
+                    catch (Exception e)
+                    {
+                        _logger.LogError(e, "Error while processing chunk: {ChunkId}", deliver.Chunk.ChunkId);
+                    }
                 }, async b =>
                 {
                     if (_config.ConsumerUpdateListener != null)
